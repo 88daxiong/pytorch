@@ -3,6 +3,7 @@
 #include "torch/csrc/jit/assertions.h"
 #include "torch/csrc/jit/autodiff.h"
 #include "torch/csrc/jit/ir.h"
+#include "torch/csrc/jit/passes/alias_analysis.h"
 #include "torch/csrc/jit/passes/common_subexpression_elimination.h"
 #include "torch/csrc/jit/passes/utils/subgraph_utils.h"
 
@@ -17,7 +18,9 @@ class SubgraphSlicer {
       Block* block,
       std::shared_ptr<Graph> graph,
       size_t minSubgraphSize)
-      : block_(block), graph_(std::move(graph)), minSubgraphSize_(minSubgraphSize) {}
+      : block_(block),
+        graph_(std::move(graph)),
+        minSubgraphSize_(minSubgraphSize) {}
 
   void run(std::vector<Node*>& diffGraphs) {
     // We need to run the slicer multiple times in order to get all merge
@@ -37,9 +40,10 @@ class SubgraphSlicer {
     bool any_changed = true;
     while (any_changed) {
       any_changed = false;
+      auto aliasDb = AliasAnalysis(graph_);
       for (auto it = block_->nodes().rbegin(); it != block_->nodes().rend();) {
         bool changed;
-        std::tie(it, changed) = scanNode(*it);
+        std::tie(it, changed) = scanNode(*it, aliasDb);
         any_changed |= changed;
       }
     }
@@ -117,7 +121,9 @@ class SubgraphSlicer {
     return isDifferentiable(node);
   }
 
-  std::pair<graph_node_list::iterator, bool> scanNode(Node* consumer) {
+  std::pair<graph_node_list::iterator, bool> scanNode(
+      Node* consumer,
+      const AliasDb& aliasDb) {
     if (shouldConsiderForMerge(consumer)) {
       if (consumer->kind() != prim::DifferentiableGraph) {
         consumer = SubgraphUtils::createSingletonSubgraph(
@@ -125,7 +131,7 @@ class SubgraphSlicer {
       }
       auto inputs = sortReverseTopological(consumer->inputs());
       for (auto input : inputs) {
-        if (auto group = tryMerge(consumer, input->node())) {
+        if (auto group = tryMerge(consumer, input->node(), aliasDb)) {
           // we successfully merged, so the new group's `inputs` may have
           // changed. So rescan the new group for more merging opportunities.
           return std::make_pair(group.value()->reverseIterator(), true);
@@ -138,10 +144,13 @@ class SubgraphSlicer {
 
   // Try to merge `producer` into `consumer`. If successful, this destroys
   // `producer` and returns the `consumer` group.
-  c10::optional<Node*> tryMerge(Node* consumer, Node* producer) {
+  c10::optional<Node*> tryMerge(
+      Node* consumer,
+      Node* producer,
+      const AliasDb& aliasDb) {
     JIT_ASSERT(consumer->kind() == prim::DifferentiableGraph);
     bool canMerge = shouldConsiderForMerge(producer) &&
-        producer->moveBeforeTopologicallyValid(consumer);
+        producer->moveBeforeTopologicallyValid(consumer, aliasDb);
 
     if (!canMerge) {
       return c10::nullopt;
